@@ -41,8 +41,10 @@ echo "→  Installing Python packages…"
 "$PIP" install --user --quiet --upgrade requests browser-cookie3 curl_cffi
 echo "✓  Python packages"
 
-# ── 4. Make app executable ────────────────────────────────────────────────────
+# ── 4. Make app executable + copy bundled icon ───────────────────────────────
 chmod +x "$APP"
+mkdir -p "$HOME/.config/claude-tray"
+cp "$SCRIPT_DIR/icon.png" "$HOME/.config/claude-tray/icon.png"
 
 # ── 5. Application menu shortcut ─────────────────────────────────────────────
 APPS_DIR="$HOME/.local/share/applications"
