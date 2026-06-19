@@ -45,7 +45,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Colours ───────────────────────────────────────────────────────────────────
+# ── Default colours ───────────────────────────────────────────────────────────
 BG      = "#1C1917"
 SURFACE = "#292524"
 ACCENT  = "#D97757"
@@ -56,13 +56,14 @@ SUBTEXT = "#A09080"
 TROUGH  = "#3D3330"
 BORDER  = "#403B38"
 
-CSS = f"""
-/* Window root is transparent — card provides the visible rounded background */
+
+def build_css(bg_color: str = BG, bar_color: str = ACCENT) -> str:
+    return f"""
 window.popup-win, window.float-win {{
     background-color: transparent;
 }}
 .card {{
-    background-color: {BG};
+    background-color: {bg_color};
     border: 1px solid {BORDER};
     border-radius: 10px;
     padding: 16px;
@@ -73,7 +74,7 @@ label.win-title {{
     font-size: 15px;
 }}
 label.plan-badge {{
-    color: {ACCENT};
+    color: {bar_color};
     font-size: 11px;
     font-weight: bold;
 }}
@@ -117,11 +118,20 @@ button.refresh-btn:hover {{
     color: {TEXT};
     border-color: {SUBTEXT};
 }}
-progressbar {{ min-height: 7px; border-radius: 4px; }}
+progressbar {{
+    min-height: 7px;
+    border-radius: 4px;
+    border: none;
+    box-shadow: none;
+    outline: none;
+}}
 progressbar progress {{
-    background-color: {ACCENT};
+    background-color: {bar_color};
     border-radius: 4px;
     min-height: 7px;
+    border: none;
+    box-shadow: none;
+    outline: none;
 }}
 progressbar.warn progress  {{ background-color: {WARNING}; }}
 progressbar.crit progress  {{ background-color: {DANGER};  }}
@@ -129,6 +139,9 @@ progressbar trough {{
     background-color: {TROUGH};
     border-radius: 4px;
     min-height: 7px;
+    border: none;
+    box-shadow: none;
+    outline: none;
 }}
 label.section-header {{
     color: {SUBTEXT};
@@ -153,6 +166,7 @@ class LimitEntry:
 class UsageData:
     limits:     List[LimitEntry] = field(default_factory=list)
     plan:       str = "Pro"
+    name:       str = ""
     updated_at: Optional[datetime] = None
     error:      Optional[str] = None
     sessions:   List["SessionEntry"] = field(default_factory=list)
@@ -168,6 +182,16 @@ class SessionEntry:
     context_limit:  int = 200_000
     status:         str = "idle"
     started_at:     int = 0
+
+
+@dataclass
+class AppSettings:
+    auto_refresh:     bool  = True
+    refresh_interval: int   = 60
+    opacity:          float = 1.0
+    opacity_popup:    bool  = False
+    bar_color:        str   = ACCENT
+    bg_color:         str   = BG
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -225,6 +249,20 @@ def fmt_updated(dt: Optional[datetime]) -> str:
 
 def _bar_css_class(severity: str) -> Optional[str]:
     return {"warning": "warn", "critical": "crit"}.get(severity)
+
+
+def _hex_to_rgba(hex_color: str) -> Gdk.RGBA:
+    rgba = Gdk.RGBA()
+    rgba.parse(hex_color)
+    return rgba
+
+
+def _rgba_to_hex(rgba: Gdk.RGBA) -> str:
+    return "#{:02X}{:02X}{:02X}".format(
+        int(rgba.red * 255),
+        int(rgba.green * 255),
+        int(rgba.blue * 255),
+    )
 
 
 def _enable_rgba(win: Gtk.Window):
@@ -421,6 +459,15 @@ class ClaudeUsageFetcher:
             d.plan = PLAN_MAP.get(bt, "Pro")
         except Exception:
             d.plan = "Pro"
+
+        try:
+            acct   = boot.get("account", {})
+            d.name = (acct.get("full_name") or
+                      acct.get("display_name") or
+                      acct.get("name") or
+                      acct.get("email_address", "").split("@")[0] or "")
+        except Exception:
+            d.name = ""
 
         try:
             if not self._org_id:
@@ -809,12 +856,13 @@ class LeftClickPopup:
         self._shield.hide()
 
     def update(self, data: UsageData):
-        self._plan_lbl.set_text(data.plan)
+        self._plan_lbl.set_text(f"{data.name}  ·  {data.plan}" if data.name else data.plan)
         for child in self._content_slot.get_children():
             self._content_slot.remove(child)
         self._content_slot.pack_start(build_content(data), False, False, 0)
         self._upd_lbl.set_text(fmt_updated(data.updated_at))
         self._content_slot.show_all()
+        self._win.resize(1, 1)
 
     def toggle(self, cx: int, cy: int):
         if self._win.get_visible():
@@ -945,8 +993,26 @@ class FloatingWindow:
         CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
         return False  # one-shot
 
+    def _save_visibility(self, visible: bool):
+        cfg = {}
+        if CONFIG_FILE.exists():
+            try:
+                cfg = json.loads(CONFIG_FILE.read_text())
+            except Exception:
+                pass
+        cfg["float_visible"] = visible
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+    def was_visible(self) -> bool:
+        if CONFIG_FILE.exists():
+            try:
+                return json.loads(CONFIG_FILE.read_text()).get("float_visible", False)
+            except Exception:
+                pass
+        return False
+
     def update(self, data: UsageData):
-        self._plan_lbl.set_text(data.plan)
+        self._plan_lbl.set_text(f"{data.name}  ·  {data.plan}" if data.name else data.plan)
         for child in self._content_slot.get_children():
             self._content_slot.remove(child)
         self._content_slot.pack_start(build_content(data), False, False, 0)
@@ -962,6 +1028,7 @@ class FloatingWindow:
         else:
             self._win.resize(1, 1)
             GLib.idle_add(self._default_pos)
+        self._save_visibility(True)
 
     def _default_pos(self):
         sc   = self._win.get_screen()
@@ -970,33 +1037,185 @@ class FloatingWindow:
 
     def hide(self):
         self._save_pos()
+        self._save_visibility(False)
         self._win.hide()
 
     def is_visible(self) -> bool:
         return self._win.get_visible()
 
 
+# ── Settings dialog ───────────────────────────────────────────────────────────
+class SettingsDialog:
+    def __init__(self, settings: AppSettings, on_apply):
+        self._on_apply = on_apply
+
+        self._win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        self._win.set_title("Settings")
+        self._win.set_decorated(True)
+        self._win.set_resizable(False)
+        self._win.set_keep_above(True)
+        self._win.set_border_width(20)
+        self._win.connect("delete-event", lambda w, e: w.hide() or True)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        self._win.add(outer)
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(14)
+        grid.set_column_spacing(20)
+        outer.pack_start(grid, False, False, 0)
+
+        row = 0
+
+        # ── Auto Refresh ──────────────────────────────────────────────────────
+        self._ar_check = Gtk.CheckButton(label="Auto Refresh")
+        self._ar_check.set_active(settings.auto_refresh)
+        grid.attach(self._ar_check, 0, row, 2, 1)
+        row += 1
+
+        # ── Refresh Interval ──────────────────────────────────────────────────
+        ri_lbl = Gtk.Label(label="Refresh Interval (seconds)")
+        ri_lbl.set_halign(Gtk.Align.START)
+        adj = Gtk.Adjustment(
+            value=settings.refresh_interval,
+            lower=15, upper=3600,
+            step_increment=15, page_increment=60,
+        )
+        self._ri_spin = Gtk.SpinButton(adjustment=adj, climb_rate=1, digits=0)
+        self._ri_spin.set_size_request(100, -1)
+        grid.attach(ri_lbl,        0, row, 1, 1)
+        grid.attach(self._ri_spin, 1, row, 1, 1)
+        row += 1
+
+        # ── Separator ─────────────────────────────────────────────────────────
+        grid.attach(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), 0, row, 2, 1)
+        row += 1
+
+        # ── Opacity ───────────────────────────────────────────────────────────
+        op_lbl = Gtk.Label(label="Opacity (floating window)")
+        op_lbl.set_halign(Gtk.Align.START)
+        op_adj = Gtk.Adjustment(
+            value=settings.opacity,
+            lower=0.1, upper=1.0,
+            step_increment=0.05, page_increment=0.1,
+        )
+        self._op_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=op_adj)
+        self._op_scale.set_size_request(200, -1)
+        self._op_scale.set_digits(2)
+        self._op_scale.set_draw_value(True)
+        grid.attach(op_lbl,        0, row, 1, 1)
+        grid.attach(self._op_scale, 1, row, 1, 1)
+        row += 1
+
+        # ── Apply opacity to popup ────────────────────────────────────────────
+        self._pop_check = Gtk.CheckButton(label="Also apply opacity to left-click popup")
+        self._pop_check.set_active(settings.opacity_popup)
+        grid.attach(self._pop_check, 0, row, 2, 1)
+        row += 1
+
+        # ── Separator ─────────────────────────────────────────────────────────
+        grid.attach(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), 0, row, 2, 1)
+        row += 1
+
+        # ── Progress Bar Color ────────────────────────────────────────────────
+        bc_lbl = Gtk.Label(label="Progress Bar Color")
+        bc_lbl.set_halign(Gtk.Align.START)
+        self._bc_btn = Gtk.ColorButton()
+        self._bc_btn.set_rgba(_hex_to_rgba(settings.bar_color))
+        self._bc_btn.set_title("Choose Progress Bar Color")
+        grid.attach(bc_lbl,       0, row, 1, 1)
+        grid.attach(self._bc_btn, 1, row, 1, 1)
+        row += 1
+
+        # ── Background Color ──────────────────────────────────────────────────
+        bg_lbl = Gtk.Label(label="Background Color")
+        bg_lbl.set_halign(Gtk.Align.START)
+        self._bg_btn = Gtk.ColorButton()
+        self._bg_btn.set_rgba(_hex_to_rgba(settings.bg_color))
+        self._bg_btn.set_title("Choose Background Color")
+        grid.attach(bg_lbl,       0, row, 1, 1)
+        grid.attach(self._bg_btn, 1, row, 1, 1)
+        row += 1
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_halign(Gtk.Align.END)
+        btn_box.set_margin_top(4)
+
+        reset_btn = Gtk.Button(label="Reset Defaults")
+        reset_btn.connect("clicked", self._reset_defaults)
+        btn_box.pack_start(reset_btn, False, False, 0)
+
+        apply_btn = Gtk.Button(label="Apply")
+        apply_btn.connect("clicked", self._apply)
+        btn_box.pack_start(apply_btn, False, False, 0)
+
+        close_btn = Gtk.Button(label="Close")
+        close_btn.connect("clicked", lambda _: self._win.hide())
+        btn_box.pack_start(close_btn, False, False, 0)
+
+        outer.pack_start(btn_box, False, False, 0)
+
+    def _collect(self) -> AppSettings:
+        return AppSettings(
+            auto_refresh     = self._ar_check.get_active(),
+            refresh_interval = int(self._ri_spin.get_value()),
+            opacity          = round(self._op_scale.get_value(), 2),
+            opacity_popup    = self._pop_check.get_active(),
+            bar_color        = _rgba_to_hex(self._bc_btn.get_rgba()),
+            bg_color         = _rgba_to_hex(self._bg_btn.get_rgba()),
+        )
+
+    def _apply(self, _):
+        self._on_apply(self._collect())
+
+    def _reset_defaults(self, _):
+        defaults = AppSettings()
+        self._ar_check.set_active(defaults.auto_refresh)
+        self._ri_spin.set_value(defaults.refresh_interval)
+        self._op_scale.set_value(defaults.opacity)
+        self._pop_check.set_active(defaults.opacity_popup)
+        self._bc_btn.set_rgba(_hex_to_rgba(defaults.bar_color))
+        self._bg_btn.set_rgba(_hex_to_rgba(defaults.bg_color))
+        self._on_apply(defaults)
+
+    def sync(self, settings: AppSettings):
+        self._ar_check.set_active(settings.auto_refresh)
+        self._ri_spin.set_value(settings.refresh_interval)
+        self._op_scale.set_value(settings.opacity)
+        self._pop_check.set_active(settings.opacity_popup)
+        self._bc_btn.set_rgba(_hex_to_rgba(settings.bar_color))
+        self._bg_btn.set_rgba(_hex_to_rgba(settings.bg_color))
+
+    def show(self):
+        self._win.show_all()
+        self._win.present()
+
+
 # ── Main app ──────────────────────────────────────────────────────────────────
 class ClaudeTrayApp:
-    REFRESH_INTERVAL = 60   # seconds between full API fetches
-    UI_TICK          = 30   # seconds between countdown label refreshes (no network call)
-
     def __init__(self):
-        provider = Gtk.CssProvider()
-        provider.load_from_data(CSS.encode())
+        self._settings = self._load_settings()
+
+        self._css_provider = Gtk.CssProvider()
+        self._css_provider.load_from_data(
+            build_css(self._settings.bg_color, self._settings.bar_color).encode()
+        )
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(),
-            provider,
+            self._css_provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
         create_tray_icon(ICON_FILE)
 
-        self._auto_refresh   = True
         self._fetcher        = ClaudeUsageFetcher()
         self._session_reader = ClaudeSessionReader()
         self._popup          = LeftClickPopup(on_refresh=self._do_refresh)
         self._float          = FloatingWindow(on_refresh=self._do_refresh)
+        self._settings_dlg   = SettingsDialog(self._settings, on_apply=self._apply_settings)
+
+        self._apply_opacity()
 
         self._fetcher._load_cookies()
 
@@ -1007,10 +1226,73 @@ class ClaudeTrayApp:
         self._tray.connect("activate",   self._on_left_click)
         self._tray.connect("popup-menu", self._on_right_click)
 
-        self._do_refresh()
-        GLib.timeout_add_seconds(self.REFRESH_INTERVAL, self._refresh_timer)
-        GLib.timeout_add_seconds(self.UI_TICK,          self._ui_tick)
+        if self._float.was_visible():
+            self._float.show()
 
+        self._do_refresh()
+        self._refresh_timer_id = GLib.timeout_add_seconds(
+            self._settings.refresh_interval, self._refresh_timer
+        )
+        GLib.timeout_add_seconds(30, self._ui_tick)
+
+    # ── Settings persistence ──────────────────────────────────────────────────
+    def _load_settings(self) -> AppSettings:
+        if CONFIG_FILE.exists():
+            try:
+                s = json.loads(CONFIG_FILE.read_text()).get("settings", {})
+                return AppSettings(
+                    auto_refresh     = s.get("auto_refresh",     True),
+                    refresh_interval = s.get("refresh_interval", 60),
+                    opacity          = s.get("opacity",          1.0),
+                    opacity_popup    = s.get("opacity_popup",    False),
+                    bar_color        = s.get("bar_color",        ACCENT),
+                    bg_color         = s.get("bg_color",         BG),
+                )
+            except Exception:
+                pass
+        return AppSettings()
+
+    def _save_settings(self):
+        cfg = {}
+        if CONFIG_FILE.exists():
+            try:
+                cfg = json.loads(CONFIG_FILE.read_text())
+            except Exception:
+                pass
+        cfg["settings"] = {
+            "auto_refresh":     self._settings.auto_refresh,
+            "refresh_interval": self._settings.refresh_interval,
+            "opacity":          self._settings.opacity,
+            "opacity_popup":    self._settings.opacity_popup,
+            "bar_color":        self._settings.bar_color,
+            "bg_color":         self._settings.bg_color,
+        }
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+    def _apply_settings(self, settings: AppSettings):
+        interval_changed = settings.refresh_interval != self._settings.refresh_interval
+        self._settings = settings
+
+        self._css_provider.load_from_data(
+            build_css(settings.bg_color, settings.bar_color).encode()
+        )
+        self._apply_opacity()
+
+        if interval_changed:
+            GLib.source_remove(self._refresh_timer_id)
+            self._refresh_timer_id = GLib.timeout_add_seconds(
+                settings.refresh_interval, self._refresh_timer
+            )
+
+        self._save_settings()
+        GLib.idle_add(self._on_data_ready)
+
+    def _apply_opacity(self):
+        self._float._win.set_opacity(self._settings.opacity)
+        popup_opacity = self._settings.opacity if self._settings.opacity_popup else 1.0
+        self._popup._win.set_opacity(popup_opacity)
+
+    # ── Data flow ─────────────────────────────────────────────────────────────
     def _do_refresh(self):
         threading.Thread(target=self._fetch_thread, daemon=True).start()
 
@@ -1037,9 +1319,9 @@ class ClaudeTrayApp:
         return "Claude — " + " | ".join(parts)
 
     def _refresh_timer(self) -> bool:
-        if self._auto_refresh:
+        if self._settings.auto_refresh:
             self._do_refresh()
-        return True  # keep timer alive regardless
+        return True  # keep timer alive
 
     def _ui_tick(self) -> bool:
         data = self._merge_sessions(self._fetcher.get())
@@ -1048,6 +1330,7 @@ class ClaudeTrayApp:
             self._float.update(data)
         return True
 
+    # ── Tray events ───────────────────────────────────────────────────────────
     def _on_left_click(self, icon):
         display = Gdk.Display.get_default()
         _, cx, cy = display.get_default_seat().get_pointer().get_position()
@@ -1057,17 +1340,14 @@ class ClaudeTrayApp:
     def _on_right_click(self, icon, button, time):
         menu = Gtk.Menu()
 
-        # Show / Hide floating window
         lbl    = "Hide Floating Window" if self._float.is_visible() else "Show Floating Window"
         toggle = Gtk.MenuItem(label=lbl)
         toggle.connect("activate", self._toggle_float)
         menu.append(toggle)
 
-        # Auto-refresh toggle
-        ar_lbl  = "Auto Refresh: ON  ✓" if self._auto_refresh else "Auto Refresh: OFF"
-        ar_item = Gtk.MenuItem(label=ar_lbl)
-        ar_item.connect("activate", self._toggle_auto_refresh)
-        menu.append(ar_item)
+        settings_item = Gtk.MenuItem(label="Settings…")
+        settings_item.connect("activate", lambda _: self._settings_dlg.show())
+        menu.append(settings_item)
 
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -1084,10 +1364,6 @@ class ClaudeTrayApp:
         else:
             self._float.update(self._merge_sessions(self._fetcher.get()))
             self._float.show()
-
-    def _toggle_auto_refresh(self, _):
-        self._auto_refresh = not self._auto_refresh
-        log.info(f"Auto-refresh {'enabled' if self._auto_refresh else 'disabled'}")
 
     def run(self):
         Gtk.main()
