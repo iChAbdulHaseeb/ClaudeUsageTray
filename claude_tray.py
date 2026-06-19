@@ -135,11 +135,12 @@ progressbar trough {{
 # ── Data ──────────────────────────────────────────────────────────────────────
 @dataclass
 class LimitEntry:
-    label:     str   = ""
-    pct:       float = 0.0
-    severity:  str   = "normal"
-    resets_at: str   = ""
-    is_weekly: bool  = False
+    label:       str   = ""
+    pct:         float = 0.0
+    severity:    str   = "normal"
+    resets_at:   str   = ""
+    is_weekly:   bool  = False
+    placeholder: bool  = False   # True when the API returned no data for this slot
 
 
 @dataclass
@@ -376,9 +377,6 @@ class ClaudeUsageFetcher:
                 if kind not in LIMIT_LABEL:
                     continue
                 label, is_weekly = LIMIT_LABEL[kind]
-                # Skip zero/inactive secondary model limits
-                if not item.get("is_active", True) and item.get("percent", 0) == 0:
-                    continue
                 d.limits.append(LimitEntry(
                     label     = label,
                     pct       = float(item.get("percent", item.get("utilization", 0))),
@@ -394,12 +392,21 @@ class ClaudeUsageFetcher:
                     unique.append(lim)
             d.limits = unique
 
-        if not d.limits:
-            d.error = (
-                "No usage data returned.\n"
-                "Log into claude.ai in Chrome/Firefox\n"
-                "then restart this app."
-            )
+        # Always show both expected slots; fill missing ones with a placeholder
+        EXPECTED = [("5-Hour Window", False), ("Weekly", True)]
+        present  = {lim.label for lim in d.limits}
+        for label, is_weekly in EXPECTED:
+            if label not in present:
+                d.limits.append(LimitEntry(
+                    label       = label,
+                    pct         = 0.0,
+                    is_weekly   = is_weekly,
+                    placeholder = True,
+                ))
+        # Keep canonical order: 5-Hour Window first, then Weekly
+        order = {label: i for i, (label, _) in enumerate(EXPECTED)}
+        d.limits.sort(key=lambda lim: order.get(lim.label, 99))
+
         return d
 
     def refresh(self):
@@ -465,21 +472,25 @@ def make_progress_row(entry: LimitEntry) -> Gtk.Box:
     # Under bar: LEFT = "33% used · 2h 55m"   RIGHT = "3:30 PM" / "Friday"
     under = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
 
-    countdown = fmt_countdown(entry.resets_at)
-    left_text = f"{int(entry.pct)}% used"
-    if countdown:
-        left_text += f"  ·  {countdown}"
+    if entry.placeholder:
+        left_text = "Not started"
+    else:
+        countdown = fmt_countdown(entry.resets_at)
+        left_text = f"{int(entry.pct)}% used"
+        if countdown:
+            left_text += f"  ·  {countdown}"
     left_lbl = Gtk.Label(label=left_text)
     left_lbl.get_style_context().add_class("pct-sub")
     left_lbl.set_halign(Gtk.Align.START)
     under.pack_start(left_lbl, True, True, 0)
 
-    abs_time = fmt_reset_absolute(entry.resets_at, entry.is_weekly)
-    if abs_time:
-        right_lbl = Gtk.Label(label=abs_time)
-        right_lbl.get_style_context().add_class("reset-abs")
-        right_lbl.set_halign(Gtk.Align.END)
-        under.pack_end(right_lbl, False, False, 0)
+    if not entry.placeholder:
+        abs_time = fmt_reset_absolute(entry.resets_at, entry.is_weekly)
+        if abs_time:
+            right_lbl = Gtk.Label(label=abs_time)
+            right_lbl.get_style_context().add_class("reset-abs")
+            right_lbl.set_halign(Gtk.Align.END)
+            under.pack_end(right_lbl, False, False, 0)
 
     root.pack_start(under, False, False, 0)
     return root
