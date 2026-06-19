@@ -222,6 +222,7 @@ class UsageData:
     updated_at: Optional[datetime] = None
     error:      Optional[str] = None
     sessions:   List["SessionEntry"] = field(default_factory=list)
+    activity:   dict = field(default_factory=dict)  # {(date_str, hour): tokens}
 
 
 @dataclass
@@ -243,6 +244,7 @@ class AppSettings:
     opacity:          float = 1.0
     opacity_popup:    bool  = False
     keep_below:       bool  = False
+    show_graph:       bool  = True
     bar_color:        str   = ACCENT
     bg_color:         str   = BG
 
@@ -691,6 +693,61 @@ class ClaudeSessionReader:
         return 0, ""
 
 
+# ── Activity reader ───────────────────────────────────────────────────────────
+class ActivityReader:
+    """Scans local JSONL session files to build a (date, hour) → tokens map."""
+
+    LOOKBACK_DAYS = 7
+
+    def read(self) -> dict:
+        result = {}
+        if not CLAUDE_PROJECTS_DIR.exists():
+            return result
+        cutoff_ts = _time.time() - self.LOOKBACK_DAYS * 86400
+        cutoff_dt = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc)
+        for jsonl_path in CLAUDE_PROJECTS_DIR.glob("*/*.jsonl"):
+            try:
+                if jsonl_path.stat().st_mtime < cutoff_ts:
+                    continue
+                self._scan_file(jsonl_path, cutoff_dt, result)
+            except Exception as e:
+                log.debug(f"ActivityReader skip {jsonl_path}: {e}")
+        return result
+
+    def _scan_file(self, path: Path, cutoff_dt: datetime, result: dict):
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                if '"type":"assistant"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                ts = obj.get("timestamp", "")
+                if not ts:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if dt < cutoff_dt:
+                    continue
+                usage = obj.get("message", {}).get("usage", {})
+                tokens = (
+                    usage.get("input_tokens", 0) +
+                    usage.get("cache_creation_input_tokens", 0) +
+                    usage.get("cache_read_input_tokens", 0) +
+                    usage.get("output_tokens", 0)
+                )
+                if tokens <= 0:
+                    continue
+                local_dt = dt.astimezone()
+                key = (local_dt.strftime("%Y-%m-%d"), local_dt.hour)
+                result[key] = result.get(key, 0) + tokens
+
+
 # ── Progress row ──────────────────────────────────────────────────────────────
 def make_progress_row(entry: LimitEntry) -> Gtk.Box:
     root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -912,6 +969,121 @@ class LeftClickPopup:
             gdk_win.raise_()
 
 
+# ── Contribution graph ────────────────────────────────────────────────────────
+class ContributionGraph(Gtk.DrawingArea):
+    DAYS  = 7
+    HOURS = 24
+
+    def __init__(self):
+        super().__init__()
+        self._data      = {}
+        self._bar_r = self._bar_g = self._bar_b = 0.85
+        self._bg_r  = self._bg_g  = self._bg_b  = 0.11
+        self.set_size_request(-1, 84)
+        self.connect("draw", self._on_draw)
+
+    def set_data(self, activity: dict):
+        self._data = activity
+        self.queue_draw()
+
+    def set_colors(self, bar_hex: str, bg_hex: str):
+        self._bar_r, self._bar_g, self._bar_b = self._hex_to_rgb(bar_hex)
+        self._bg_r,  self._bg_g,  self._bg_b  = self._hex_to_rgb(bg_hex)
+        self.queue_draw()
+
+    def set_scale(self, scale: float):
+        h = max(56, int(84 * scale))
+        self.set_size_request(-1, h)
+        self.queue_draw()
+
+    @staticmethod
+    def _hex_to_rgb(hex_color: str):
+        h = hex_color.lstrip("#")
+        if len(h) == 3:
+            h = h[0]*2 + h[1]*2 + h[2]*2
+        return int(h[0:2],16)/255, int(h[2:4],16)/255, int(h[4:6],16)/255
+
+    def _on_draw(self, widget, cr):
+        from datetime import date, timedelta
+
+        alloc  = self.get_allocation()
+        W, H   = alloc.width, alloc.height
+
+        LABEL_W = 26
+        LABEL_H = 13
+        GAP     = 2
+
+        gw = W - LABEL_W
+        gh = H - LABEL_H
+
+        cw = (gw - (self.HOURS - 1) * GAP) / self.HOURS
+        ch = (gh - (self.DAYS  - 1) * GAP) / self.DAYS
+
+        today = date.today()
+        days  = [today - timedelta(days=self.DAYS - 1 - i) for i in range(self.DAYS)]
+
+        max_tok = max(self._data.values(), default=1) or 1
+
+        ar, ag, ab = self._bar_r, self._bar_g, self._bar_b
+        bgr, bgg, bgb = self._bg_r, self._bg_g, self._bg_b
+        # empty cell: slightly lighter than bg
+        er = min(1.0, bgr + 0.10)
+        eg = min(1.0, bgg + 0.09)
+        eb = min(1.0, bgb + 0.08)
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+
+        for row, d in enumerate(days):
+            date_str = d.strftime("%Y-%m-%d")
+            day_name = d.strftime("%a")
+
+            # day label
+            cr.set_source_rgba(0.63, 0.56, 0.50, 0.9)
+            cr.set_font_size(8)
+            ext = cr.text_extents(day_name)
+            y_cell_top = row * (ch + GAP)
+            cr.move_to(max(0, LABEL_W - ext[2] - 3), y_cell_top + ch/2 + ext[3]/2)
+            cr.show_text(day_name)
+
+            for col in range(self.HOURS):
+                tokens    = self._data.get((date_str, col), 0)
+                intensity = tokens / max_tok if tokens > 0 else 0
+
+                x = LABEL_W + col * (cw + GAP)
+                y = y_cell_top
+                rr = max(1.5, min(cw, ch) * 0.28)
+
+                if intensity > 0:
+                    t = 0.18 + 0.82 * intensity
+                    cr.set_source_rgb(
+                        bgr + (ar - bgr) * t,
+                        bgg + (ag - bgg) * t,
+                        bgb + (ab - bgb) * t,
+                    )
+                else:
+                    cr.set_source_rgb(er, eg, eb)
+
+                self._rrect(cr, x, y, cw, ch, rr)
+                cr.fill()
+
+        # hour tick labels
+        cr.set_source_rgba(0.63, 0.56, 0.50, 0.7)
+        cr.set_font_size(7)
+        for h_tick in [0, 6, 12, 18, 23]:
+            x = LABEL_W + h_tick * (cw + GAP)
+            cr.move_to(x, H - 1)
+            cr.show_text(str(h_tick))
+
+    @staticmethod
+    def _rrect(cr, x, y, w, h, r):
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r,     r, -math.pi/2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0,           math.pi/2)
+        cr.arc(x + r,     y + h - r, r, math.pi/2,   math.pi)
+        cr.arc(x + r,     y + r,     r, math.pi,     3*math.pi/2)
+        cr.close_path()
+
+
 # ── Floating window ───────────────────────────────────────────────────────────
 class FloatingWindow:
     def __init__(self, on_refresh, on_scale_change):
@@ -958,8 +1130,16 @@ class FloatingWindow:
         self._card.pack_start(hdr, False, False, 0)
 
         self._card.pack_start(
-            Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 8
+            Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 6
         )
+
+        # Activity graph (hidden by default until settings are applied)
+        self._graph       = ContributionGraph()
+        self._graph_wrap  = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._graph_wrap.pack_start(self._graph, False, False, 0)
+        self._graph_sep   = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        self._graph_wrap.pack_start(self._graph_sep, False, False, 6)
+        self._card.pack_start(self._graph_wrap, False, False, 0)
 
         self._content_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self._card.pack_start(self._content_slot, False, False, 0)
@@ -1074,9 +1254,20 @@ class FloatingWindow:
         self._content_slot.pack_start(build_content(data), False, False, 0)
         self._upd_lbl.set_text(fmt_updated(data.updated_at))
         self._content_slot.show_all()
+        if data.activity:
+            self._graph.set_data(data.activity)
         if self._win.get_visible():
             w, _ = self._win.get_size()
             self._win.resize(w, 1)
+
+    def set_graph_visible(self, show: bool):
+        self._graph_wrap.set_visible(show)
+        if self._win.get_visible():
+            w, _ = self._win.get_size()
+            self._win.resize(w, 1)
+
+    def apply_graph_colors(self, bar_hex: str, bg_hex: str):
+        self._graph.set_colors(bar_hex, bg_hex)
 
     def show(self):
         self._win.show_all()
@@ -1189,6 +1380,11 @@ class SettingsDialog:
         grid.attach(self._kb_check, 0, row, 2, 1)
         row += 1
 
+        self._sg_check = Gtk.CheckButton(label="Show activity graph")
+        self._sg_check.set_active(settings.show_graph)
+        grid.attach(self._sg_check, 0, row, 2, 1)
+        row += 1
+
         grid.attach(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), 0, row, 2, 1)
         row += 1
 
@@ -1241,6 +1437,7 @@ class SettingsDialog:
             opacity          = round(self._op_scale.get_value(), 2),
             opacity_popup    = self._pop_check.get_active(),
             keep_below       = self._kb_check.get_active(),
+            show_graph       = self._sg_check.get_active(),
             bar_color        = _rgba_to_hex(self._bc_btn.get_rgba()),
             bg_color         = _rgba_to_hex(self._bg_btn.get_rgba()),
         )
@@ -1259,6 +1456,7 @@ class SettingsDialog:
         self._op_scale.set_value(defaults.opacity)
         self._pop_check.set_active(defaults.opacity_popup)
         self._kb_check.set_active(defaults.keep_below)
+        self._sg_check.set_active(defaults.show_graph)
         self._bc_btn.set_rgba(_hex_to_rgba(defaults.bar_color))
         self._bg_btn.set_rgba(_hex_to_rgba(defaults.bg_color))
         self._on_apply(defaults)
@@ -1269,6 +1467,7 @@ class SettingsDialog:
         self._op_scale.set_value(settings.opacity)
         self._pop_check.set_active(settings.opacity_popup)
         self._kb_check.set_active(settings.keep_below)
+        self._sg_check.set_active(settings.show_graph)
         self._bc_btn.set_rgba(_hex_to_rgba(settings.bar_color))
         self._bg_btn.set_rgba(_hex_to_rgba(settings.bg_color))
 
@@ -1295,14 +1494,17 @@ class ClaudeTrayApp:
         if not ICON_FILE.exists():
             create_tray_icon(ICON_FILE)
 
-        self._fetcher        = ClaudeUsageFetcher()
-        self._session_reader = ClaudeSessionReader()
+        self._fetcher         = ClaudeUsageFetcher()
+        self._session_reader  = ClaudeSessionReader()
+        self._activity_reader = ActivityReader()
         self._popup          = LeftClickPopup(on_refresh=self._do_refresh)
         self._float          = FloatingWindow(
             on_refresh      = self._do_refresh,
             on_scale_change = self._on_float_scale,
         )
         self._float.apply_z_order(self._settings.keep_below)
+        self._float.set_graph_visible(self._settings.show_graph)
+        self._float.apply_graph_colors(self._settings.bar_color, self._settings.bg_color)
         self._settings_dlg = SettingsDialog(self._settings, on_apply=self._apply_settings)
 
         self._apply_opacity()
@@ -1327,6 +1529,7 @@ class ClaudeTrayApp:
 
     # ── Scale callback ────────────────────────────────────────────────────────
     def _on_float_scale(self, scale: float):
+        self._float._graph.set_scale(scale)
         self._css_provider.load_from_data(
             build_css(self._settings.bg_color, self._settings.bar_color, scale).encode()
         )
@@ -1342,6 +1545,7 @@ class ClaudeTrayApp:
                     opacity          = s.get("opacity",          1.0),
                     opacity_popup    = s.get("opacity_popup",    False),
                     keep_below       = s.get("keep_below",       False),
+                    show_graph       = s.get("show_graph",       True),
                     bar_color        = s.get("bar_color",        ACCENT),
                     bg_color         = s.get("bg_color",         BG),
                 )
@@ -1362,6 +1566,7 @@ class ClaudeTrayApp:
             "opacity":          self._settings.opacity,
             "opacity_popup":    self._settings.opacity_popup,
             "keep_below":       self._settings.keep_below,
+            "show_graph":       self._settings.show_graph,
             "bar_color":        self._settings.bar_color,
             "bg_color":         self._settings.bg_color,
         }
@@ -1377,6 +1582,8 @@ class ClaudeTrayApp:
         )
         self._apply_opacity()
         self._float.apply_z_order(settings.keep_below)
+        self._float.set_graph_visible(settings.show_graph)
+        self._float.apply_graph_colors(settings.bar_color, settings.bg_color)
 
         if interval_changed:
             GLib.source_remove(self._refresh_timer_id)
@@ -1398,10 +1605,15 @@ class ClaudeTrayApp:
 
     def _fetch_thread(self):
         self._fetcher.refresh()
+        self._activity_cache = self._activity_reader.read()
         GLib.idle_add(self._on_data_ready)
 
     def _merge_sessions(self, data: UsageData) -> UsageData:
-        return replace(data, sessions=self._session_reader.read())
+        return replace(
+            data,
+            sessions = self._session_reader.read(),
+            activity = getattr(self, "_activity_cache", {}),
+        )
 
     def _on_data_ready(self):
         data = self._merge_sessions(self._fetcher.get())
