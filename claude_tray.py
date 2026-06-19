@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import time as _time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List
@@ -129,6 +129,11 @@ progressbar trough {{
     border-radius: 4px;
     min-height: 7px;
 }}
+label.section-header {{
+    color: {SUBTEXT};
+    font-size: 10px;
+    font-weight: bold;
+}}
 """
 
 
@@ -149,6 +154,19 @@ class UsageData:
     plan:       str = "Pro"
     updated_at: Optional[datetime] = None
     error:      Optional[str] = None
+    sessions:   List["SessionEntry"] = field(default_factory=list)
+
+
+@dataclass
+class SessionEntry:
+    session_id:     str
+    project_name:   str    # os.path.basename(cwd)
+    cwd:            str
+    model:          str    # e.g. "claude-sonnet-4-6"
+    context_tokens: int    # input + cache_creation + cache_read from last assistant msg
+    context_limit:  int = 200_000
+    status:         str = "idle"
+    started_at:     int = 0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -450,6 +468,110 @@ class ClaudeUsageFetcher:
             return self._data
 
 
+# ── Session reader ────────────────────────────────────────────────────────────
+CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CONTEXT_LIMIT       = 200_000
+JSONL_TAIL_BYTES    = 8192
+
+_MODEL_SHORT = {
+    "claude-sonnet-4-6": "Sonnet",
+    "claude-opus-4-8":   "Opus",
+    "claude-haiku-4-5":  "Haiku",
+}
+
+
+def _model_shortname(model: str) -> str:
+    if model in _MODEL_SHORT:
+        return _MODEL_SHORT[model]
+    parts = model.split("-")
+    return parts[1].capitalize() if len(parts) > 1 else model
+
+
+class ClaudeSessionReader:
+    def read(self) -> List[SessionEntry]:
+        entries = []
+        if not CLAUDE_SESSIONS_DIR.exists():
+            return entries
+
+        for session_file in CLAUDE_SESSIONS_DIR.glob("*.json"):
+            try:
+                data = json.loads(session_file.read_text())
+            except Exception:
+                continue
+
+            pid = data.get("pid")
+            if not pid:
+                continue
+
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue        # stale file — process is dead
+            except PermissionError:
+                pass            # process alive, different user
+
+            session_id   = data.get("sessionId", "")
+            cwd          = data.get("cwd", "")
+            status       = data.get("status", "idle")
+            started_at   = data.get("startedAt", 0)
+            project_name = os.path.basename(cwd) if cwd else session_id[:8]
+
+            dir_key    = cwd.replace("/", "-")
+            jsonl_path = CLAUDE_PROJECTS_DIR / dir_key / f"{session_id}.jsonl"
+
+            context_tokens, model = self._read_last_usage(jsonl_path)
+
+            entries.append(SessionEntry(
+                session_id     = session_id,
+                project_name   = project_name,
+                cwd            = cwd,
+                model          = model,
+                context_tokens = context_tokens,
+                context_limit  = CONTEXT_LIMIT,
+                status         = status,
+                started_at     = started_at,
+            ))
+
+        entries.sort(key=lambda e: e.started_at)
+        return entries
+
+    def _read_last_usage(self, path: Path):
+        """Return (context_tokens, model) from the most recent assistant message."""
+        if not path.exists():
+            return 0, ""
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - JSONL_TAIL_BYTES), 0)
+                chunk = f.read().decode("utf-8", errors="replace")
+
+            for line in reversed(chunk.split("\n")):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue    # first line in chunk may be truncated
+                if obj.get("type") != "assistant":
+                    continue
+                msg   = obj.get("message", {})
+                usage = msg.get("usage", {})
+                if not usage:
+                    continue
+                tokens = (
+                    usage.get("input_tokens", 0) +
+                    usage.get("cache_creation_input_tokens", 0) +
+                    usage.get("cache_read_input_tokens", 0)
+                )
+                return tokens, msg.get("model", "")
+        except Exception as e:
+            log.debug(f"Session JSONL read error {path}: {e}")
+        return 0, ""
+
+
 # ── Progress row ──────────────────────────────────────────────────────────────
 def make_progress_row(entry: LimitEntry) -> Gtk.Box:
     root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -496,6 +618,42 @@ def make_progress_row(entry: LimitEntry) -> Gtk.Box:
     return root
 
 
+def make_session_row(entry: SessionEntry) -> Gtk.Box:
+    root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    root.set_margin_bottom(4)
+
+    lbl = Gtk.Label(label=entry.project_name)
+    lbl.get_style_context().add_class("row-label")
+    lbl.set_halign(Gtk.Align.START)
+    root.pack_start(lbl, False, False, 0)
+
+    fraction = min(entry.context_tokens / entry.context_limit, 1.0) if entry.context_limit else 0.0
+    bar = Gtk.ProgressBar()
+    bar.set_fraction(fraction)
+    if fraction >= 0.9:
+        bar.get_style_context().add_class("crit")
+    elif fraction >= 0.75:
+        bar.get_style_context().add_class("warn")
+    root.pack_start(bar, False, False, 0)
+
+    under    = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+    pct_int  = int(fraction * 100)
+    tokens_k = entry.context_tokens // 1000
+    left_lbl = Gtk.Label(label=f"{pct_int}%  ·  {tokens_k}K tokens")
+    left_lbl.get_style_context().add_class("pct-sub")
+    left_lbl.set_halign(Gtk.Align.START)
+    under.pack_start(left_lbl, True, True, 0)
+
+    if entry.model:
+        right_lbl = Gtk.Label(label=_model_shortname(entry.model))
+        right_lbl.get_style_context().add_class("reset-abs")
+        right_lbl.set_halign(Gtk.Align.END)
+        under.pack_end(right_lbl, False, False, 0)
+
+    root.pack_start(under, False, False, 0)
+    return root
+
+
 def build_content(data: UsageData) -> Gtk.Box:
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     if data.error and not data.limits:
@@ -512,6 +670,24 @@ def build_content(data: UsageData) -> Gtk.Box:
                     Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
                     False, False, 4,
                 )
+
+    if data.sessions:
+        box.pack_start(
+            Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+            False, False, 4,
+        )
+        hdr = Gtk.Label(label="Claude Code")
+        hdr.get_style_context().add_class("section-header")
+        hdr.set_halign(Gtk.Align.START)
+        box.pack_start(hdr, False, False, 0)
+        for i, session in enumerate(data.sessions):
+            box.pack_start(make_session_row(session), False, False, 0)
+            if i < len(data.sessions) - 1:
+                box.pack_start(
+                    Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+                    False, False, 4,
+                )
+
     return box
 
 
@@ -774,10 +950,11 @@ class ClaudeTrayApp:
 
         create_tray_icon(ICON_FILE)
 
-        self._auto_refresh = True
-        self._fetcher      = ClaudeUsageFetcher()
-        self._popup        = LeftClickPopup(on_refresh=self._do_refresh)
-        self._float        = FloatingWindow(on_refresh=self._do_refresh)
+        self._auto_refresh   = True
+        self._fetcher        = ClaudeUsageFetcher()
+        self._session_reader = ClaudeSessionReader()
+        self._popup          = LeftClickPopup(on_refresh=self._do_refresh)
+        self._float          = FloatingWindow(on_refresh=self._do_refresh)
 
         self._fetcher._load_cookies()
 
@@ -799,8 +976,11 @@ class ClaudeTrayApp:
         self._fetcher.refresh()
         GLib.idle_add(self._on_data_ready)
 
+    def _merge_sessions(self, data: UsageData) -> UsageData:
+        return replace(data, sessions=self._session_reader.read())
+
     def _on_data_ready(self):
-        data = self._fetcher.get()
+        data = self._merge_sessions(self._fetcher.get())
         self._popup.update(data)
         self._float.update(data)
         self._tray.set_tooltip_text(self._tooltip_text(data))
@@ -820,7 +1000,7 @@ class ClaudeTrayApp:
         return True  # keep timer alive regardless
 
     def _ui_tick(self) -> bool:
-        data = self._fetcher.get()
+        data = self._merge_sessions(self._fetcher.get())
         self._popup.update(data)
         if self._float.is_visible():
             self._float.update(data)
@@ -829,7 +1009,7 @@ class ClaudeTrayApp:
     def _on_left_click(self, icon):
         display = Gdk.Display.get_default()
         _, cx, cy = display.get_default_seat().get_pointer().get_position()
-        self._popup.update(self._fetcher.get())
+        self._popup.update(self._merge_sessions(self._fetcher.get()))
         self._popup.toggle(cx, cy)
 
     def _on_right_click(self, icon, button, time):
@@ -860,7 +1040,7 @@ class ClaudeTrayApp:
         if self._float.is_visible():
             self._float.hide()
         else:
-            self._float.update(self._fetcher.get())
+            self._float.update(self._merge_sessions(self._fetcher.get()))
             self._float.show()
 
     def _toggle_auto_refresh(self, _):
