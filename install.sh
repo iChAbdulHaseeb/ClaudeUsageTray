@@ -44,7 +44,7 @@ echo "✓  Python packages"
 # ── 4. Make app executable + copy bundled icon ───────────────────────────────
 chmod +x "$APP"
 mkdir -p "$HOME/.config/claude-tray"
-cp "$SCRIPT_DIR/icon.png" "$HOME/.config/claude-tray/icon.png"
+cp "$SCRIPT_DIR/calude_icon.png" "$HOME/.config/claude-tray/calude_icon.png"
 
 # ── 5. Application menu shortcut ─────────────────────────────────────────────
 APPS_DIR="$HOME/.local/share/applications"
@@ -56,7 +56,7 @@ Name=Claude Usage
 GenericName=AI Usage Monitor
 Comment=Shows Claude 5-hour and weekly usage limits in the system tray
 Exec=$PYTHON $APP
-Icon=$HOME/.config/claude-tray/icon.png
+Icon=$HOME/.config/claude-tray/calude_icon.png
 Terminal=false
 Categories=Utility;Monitor;
 Keywords=claude;ai;usage;limit;tray;

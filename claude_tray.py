@@ -34,7 +34,7 @@ except ImportError:
 CONFIG_DIR  = Path.home() / ".config" / "claude-tray"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CACHE_FILE  = CONFIG_DIR / "usage_cache.json"
-ICON_FILE   = CONFIG_DIR / "icon.png"
+ICON_FILE   = CONFIG_DIR / "calude_icon.png"
 LOG_FILE    = CONFIG_DIR / "app.log"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1071,12 +1071,15 @@ class FloatingWindow:
         self._content_slot.pack_start(build_content(data), False, False, 0)
         self._upd_lbl.set_text(fmt_updated(data.updated_at))
         self._content_slot.show_all()
+        if self._win.get_visible():
+            w, _ = self._win.get_size()
+            self._win.resize(w, 1)
 
     def show(self):
         self._win.show_all()
         size = self._load_size()
         if size:
-            self._win.resize(size[0], size[1])
+            self._win.resize(size[0], 1)   # restore width only; height is dynamic
             # Recompute scale immediately so CSS matches saved size
             saved_scale = max(0.6, min(3.0, size[0] / BASE_FLOAT_WIDTH))
             if abs(saved_scale - self._scale) > 0.02:
@@ -1260,7 +1263,8 @@ class ClaudeTrayApp:
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
-        create_tray_icon(ICON_FILE)
+        if not ICON_FILE.exists():
+            create_tray_icon(ICON_FILE)
 
         self._fetcher        = ClaudeUsageFetcher()
         self._session_reader = ClaudeSessionReader()
