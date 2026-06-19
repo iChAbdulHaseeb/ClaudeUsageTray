@@ -56,8 +56,16 @@ SUBTEXT = "#A09080"
 TROUGH  = "#3D3330"
 BORDER  = "#403B38"
 
+BASE_FLOAT_WIDTH = 320   # reference width at scale 1.0
 
-def build_css(bg_color: str = BG, bar_color: str = ACCENT) -> str:
+
+def build_css(bg_color: str = BG, bar_color: str = ACCENT, float_scale: float = 1.0) -> str:
+    s  = max(0.6, float_scale)
+    ph = max(4, round(7 * s))    # progress bar height
+    pr = max(2, round(4 * s))    # progress bar radius
+    cp = max(8, round(16 * s))   # card padding
+    cr = max(6, round(10 * s))   # card corner radius
+
     return f"""
 window.popup-win, window.float-win {{
     background-color: transparent;
@@ -102,6 +110,13 @@ label.error-lbl {{
 label.drag-hint {{
     color: {BORDER};
     font-size: 16px;
+}}
+label.resize-grip {{
+    color: {BORDER};
+    font-size: 14px;
+}}
+label.resize-grip:hover {{
+    color: {SUBTEXT};
 }}
 button.refresh-btn {{
     background: transparent;
@@ -148,6 +163,42 @@ label.section-header {{
     font-size: 10px;
     font-weight: bold;
 }}
+
+/* ── Floating window: scales with resize ─────────────────────────────────── */
+.float-win .card {{
+    background-color: {bg_color};
+    border-radius: {cr}px;
+    padding: {cp}px;
+}}
+.float-win label.win-title      {{ font-size: {round(15 * s)}px; }}
+.float-win label.plan-badge     {{ font-size: {round(11 * s)}px; color: {bar_color}; }}
+.float-win label.row-label      {{ font-size: {round(12 * s)}px; }}
+.float-win label.pct-sub        {{ font-size: {round(10 * s)}px; }}
+.float-win label.reset-abs      {{ font-size: {round(10 * s)}px; }}
+.float-win label.updated-lbl    {{ font-size: {round(10 * s)}px; }}
+.float-win label.error-lbl      {{ font-size: {round(11 * s)}px; }}
+.float-win label.drag-hint      {{ font-size: {round(16 * s)}px; }}
+.float-win label.resize-grip    {{ font-size: {round(14 * s)}px; }}
+.float-win label.section-header {{ font-size: {round(10 * s)}px; }}
+.float-win button.refresh-btn   {{ font-size: {round(10 * s)}px; }}
+.float-win progressbar {{
+    min-height: {ph}px;
+    border-radius: {pr}px;
+}}
+.float-win progressbar progress {{
+    background-color: {bar_color};
+    min-height: {ph}px;
+    border-radius: {pr}px;
+    border: none; box-shadow: none; outline: none;
+}}
+.float-win progressbar.warn progress {{ background-color: {WARNING}; }}
+.float-win progressbar.crit progress {{ background-color: {DANGER};  }}
+.float-win progressbar trough {{
+    background-color: {TROUGH};
+    min-height: {ph}px;
+    border-radius: {pr}px;
+    border: none; box-shadow: none; outline: none;
+}}
 """
 
 
@@ -159,7 +210,7 @@ class LimitEntry:
     severity:    str   = "normal"
     resets_at:   str   = ""
     is_weekly:   bool  = False
-    placeholder: bool  = False   # True when the API returned no data for this slot
+    placeholder: bool  = False
 
 
 @dataclass
@@ -175,10 +226,10 @@ class UsageData:
 @dataclass
 class SessionEntry:
     session_id:     str
-    project_name:   str    # os.path.basename(cwd)
+    project_name:   str
     cwd:            str
-    model:          str    # e.g. "claude-sonnet-4-6"
-    context_tokens: int    # input + cache_creation + cache_read from last assistant msg
+    model:          str
+    context_tokens: int
     context_limit:  int = 200_000
     status:         str = "idle"
     started_at:     int = 0
@@ -196,7 +247,6 @@ class AppSettings:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def fmt_countdown(iso: str) -> str:
-    """Remaining time until reset: '2h 55m', '45m', '1d 3h'."""
     if not iso:
         return ""
     try:
@@ -217,7 +267,6 @@ def fmt_countdown(iso: str) -> str:
 
 
 def fmt_reset_absolute(iso: str, is_weekly: bool = False) -> str:
-    """Absolute reset time shown on the right: clock time for 5-hr, day name for weekly."""
     if not iso:
         return ""
     try:
@@ -226,12 +275,11 @@ def fmt_reset_absolute(iso: str, is_weekly: bool = False) -> str:
         now      = datetime.now(timezone.utc)
         sec      = (dt - now).total_seconds()
         if is_weekly:
-            # Show day name when far away, day+time when close
             if sec > 18 * 3600:
-                return local_dt.strftime("%A")          # "Friday"
-            return local_dt.strftime("%a %-I:%M %p")   # "Fri 3:30 PM"
+                return local_dt.strftime("%A")
+            return local_dt.strftime("%a %-I:%M %p")
         else:
-            return local_dt.strftime("%-I:%M %p")      # "3:30 PM"
+            return local_dt.strftime("%-I:%M %p")
     except Exception:
         return ""
 
@@ -266,7 +314,6 @@ def _rgba_to_hex(rgba: Gdk.RGBA) -> str:
 
 
 def _enable_rgba(win: Gtk.Window):
-    """Give the window an RGBA visual so the compositor renders rounded-corner transparency."""
     screen = win.get_screen()
     visual = screen.get_rgba_visual()
     if visual:
@@ -274,48 +321,35 @@ def _enable_rgba(win: Gtk.Window):
     win.set_app_paintable(True)
 
     def _clear(widget, ctx):
-        # Erase the window to fully transparent before GTK draws widgets.
-        # Without this the X11 default black background leaks through CSS border-radius corners.
         ctx.set_source_rgba(0, 0, 0, 0)
         ctx.set_operator(cairo.OPERATOR_SOURCE)
         ctx.paint()
         ctx.set_operator(cairo.OPERATOR_OVER)
-        return False   # let normal widget drawing continue
+        return False
 
     win.connect("draw", _clear)
 
 
 def create_tray_icon(path: Path):
-    """Draw 22×22 Claude sun icon: 8 orange rays radiating from a central dot."""
     sz       = 22
     cx = cy  = sz / 2.0
     surf     = cairo.ImageSurface(cairo.FORMAT_ARGB32, sz, sz)
     ctx      = cairo.Context(surf)
-
-    # Fully transparent background (panel shows through)
     ctx.set_source_rgba(0, 0, 0, 0)
     ctx.paint()
-
-    ctx.set_source_rgb(0.851, 0.467, 0.341)   # #D97757
-
-    # 8 radiating rays with round caps
+    ctx.set_source_rgb(0.851, 0.467, 0.341)
     ctx.set_line_cap(cairo.LINE_CAP_ROUND)
     ctx.set_line_width(2.0)
     num_rays = 8
     inner_r  = 3.8
     outer_r  = 9.2
     for i in range(num_rays):
-        angle = math.pi * 2 * i / num_rays - math.pi / 2   # start from top
-        ctx.move_to(cx + inner_r * math.cos(angle),
-                    cy + inner_r * math.sin(angle))
-        ctx.line_to(cx + outer_r * math.cos(angle),
-                    cy + outer_r * math.sin(angle))
+        angle = math.pi * 2 * i / num_rays - math.pi / 2
+        ctx.move_to(cx + inner_r * math.cos(angle), cy + inner_r * math.sin(angle))
+        ctx.line_to(cx + outer_r * math.cos(angle), cy + outer_r * math.sin(angle))
         ctx.stroke()
-
-    # Central filled dot
     ctx.arc(cx, cy, 2.6, 0, 2 * math.pi)
     ctx.fill()
-
     surf.write_to_png(str(path))
 
 
@@ -489,7 +523,6 @@ class ClaudeUsageFetcher:
                     resets_at = item.get("resets_at", ""),
                     is_weekly = is_weekly,
                 ))
-            # De-duplicate by label (keep first occurrence)
             seen, unique = set(), []
             for lim in d.limits:
                 if lim.label not in seen:
@@ -497,7 +530,6 @@ class ClaudeUsageFetcher:
                     unique.append(lim)
             d.limits = unique
 
-        # Always show both expected slots; fill missing ones with a placeholder
         EXPECTED = [("5-Hour Window", False), ("Weekly", True)]
         present  = {lim.label for lim in d.limits}
         for label, is_weekly in EXPECTED:
@@ -508,10 +540,8 @@ class ClaudeUsageFetcher:
                     is_weekly   = is_weekly,
                     placeholder = True,
                 ))
-        # Keep canonical order: 5-Hour Window first, then Weekly
         order = {label: i for i, (label, _) in enumerate(EXPECTED)}
         d.limits.sort(key=lambda lim: order.get(lim.label, 99))
-
         return d
 
     def refresh(self):
@@ -595,9 +625,9 @@ class ClaudeSessionReader:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
-                continue        # stale file — process is dead
+                continue
             except PermissionError:
-                pass            # process alive, different user
+                pass
 
             session_id   = data.get("sessionId", "")
             cwd          = data.get("cwd", "")
@@ -625,7 +655,6 @@ class ClaudeSessionReader:
         return entries
 
     def _read_last_usage(self, path: Path):
-        """Return (context_tokens, model) from the most recent assistant message."""
         if not path.exists():
             return 0, ""
         try:
@@ -642,7 +671,7 @@ class ClaudeSessionReader:
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
-                    continue    # first line in chunk may be truncated
+                    continue
                 if obj.get("type") != "assistant":
                     continue
                 msg   = obj.get("message", {})
@@ -665,13 +694,11 @@ def make_progress_row(entry: LimitEntry) -> Gtk.Box:
     root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     root.set_margin_bottom(4)
 
-    # Row label at top
     lbl = Gtk.Label(label=entry.label)
     lbl.get_style_context().add_class("row-label")
     lbl.set_halign(Gtk.Align.START)
     root.pack_start(lbl, False, False, 0)
 
-    # Progress bar
     bar = Gtk.ProgressBar()
     bar.set_fraction(min(entry.pct / 100.0, 1.0))
     extra = _bar_css_class(entry.severity)
@@ -679,7 +706,6 @@ def make_progress_row(entry: LimitEntry) -> Gtk.Box:
         bar.get_style_context().add_class(extra)
     root.pack_start(bar, False, False, 0)
 
-    # Under bar: LEFT = "33% used · 2h 55m"   RIGHT = "3:30 PM" / "Friday"
     under = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
 
     if entry.placeholder:
@@ -781,38 +807,21 @@ def build_content(data: UsageData) -> Gtk.Box:
 
 # ── Left-click compact popup ──────────────────────────────────────────────────
 class LeftClickPopup:
-    """
-    Shield + popup pattern:
-    • _shield — invisible full-screen TYPE_POPUP; any click outside the popup hits
-                the shield and closes both (left OR right click).
-    • _win    — the visible card, TYPE_POPUP stacked above the shield.
-                An EventBox with above_child=True ensures clicks on any child
-                widget (labels, bars) are intercepted and close the popup.
-    • Debounce — 300 ms cooldown prevents the shield close + tray-activate
-                 signal from re-opening the popup immediately.
-    """
-
     def __init__(self, on_refresh):
         self._on_refresh  = on_refresh
-        self._last_close  = 0.0   # monotonic timestamp of last close
+        self._last_close  = 0.0
 
-        # ── Shield ────────────────────────────────────────────────────────────
         self._shield = Gtk.Window(type=Gtk.WindowType.POPUP)
         self._shield.set_decorated(False)
         _enable_rgba(self._shield)
         self._shield.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
         self._shield.connect("button-press-event", lambda *_: self._close())
 
-        # ── Popup ─────────────────────────────────────────────────────────────
         self._win = Gtk.Window(type=Gtk.WindowType.POPUP)
         self._win.set_decorated(False)
         self._win.get_style_context().add_class("popup-win")
         _enable_rgba(self._win)
 
-        # No inside-click handler — shield closes on outside clicks,
-        # inside clicks work normally so the refresh button is usable.
-
-        # ── Card ──────────────────────────────────────────────────────────────
         self._card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._card.get_style_context().add_class("card")
         self._card.set_size_request(290, -1)
@@ -835,7 +844,6 @@ class LeftClickPopup:
         self._content_slot.set_margin_top(10)
         self._card.pack_start(self._content_slot, False, False, 0)
 
-        # Bottom row: refresh button (left) + updated label (right)
         bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         bottom.set_margin_top(10)
         ref_btn = Gtk.Button(label="↻  Refresh")
@@ -868,8 +876,6 @@ class LeftClickPopup:
         if self._win.get_visible():
             self._close()
             return
-        # Debounce: shield may close popup and then the tray 'activate' fires
-        # milliseconds later — don't reopen if we just closed.
         if _time.monotonic() - self._last_close < 0.35:
             return
 
@@ -906,23 +912,28 @@ class LeftClickPopup:
 
 # ── Floating window ───────────────────────────────────────────────────────────
 class FloatingWindow:
-    def __init__(self, on_refresh):
+    def __init__(self, on_refresh, on_scale_change):
+        self._on_scale_change = on_scale_change
+        self._scale           = 1.0
+        self._resize_timer    = None
+
         self._win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         self._win.set_decorated(False)
         self._win.set_keep_above(True)
-        self._win.set_resizable(False)
+        self._win.set_resizable(True)
+        self._win.set_size_request(200, -1)
         self._win.get_style_context().add_class("float-win")
-        self._win.connect("delete-event", lambda w, e: w.hide() or True)
+        self._win.connect("delete-event",    lambda w, e: w.hide() or True)
+        self._win.connect("configure-event", self._on_configure)
         _enable_rgba(self._win)
 
-        # EventBox wraps everything so the whole surface is draggable
         drag_eb = Gtk.EventBox()
-        drag_eb.connect("button-press-event", self._on_drag)
+        drag_eb.connect("button-press-event", self._on_drag_or_resize)
         self._win.add(drag_eb)
 
         self._card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._card.get_style_context().add_class("card")
-        self._card.set_size_request(320, -1)
+        self._card.set_size_request(200, -1)
         drag_eb.add(self._card)
 
         # Header
@@ -954,63 +965,105 @@ class FloatingWindow:
             Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 8
         )
 
-        # Bottom row: refresh button (left) + updated label (right)
+        # Bottom row: refresh  ·  updated  ·  resize grip
         bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         ref_btn = Gtk.Button(label="↻  Refresh")
         ref_btn.get_style_context().add_class("refresh-btn")
         ref_btn.connect("clicked", lambda *_: on_refresh())
         bottom.pack_start(ref_btn, False, False, 0)
+
         self._upd_lbl = Gtk.Label(label="")
         self._upd_lbl.get_style_context().add_class("updated-lbl")
-        self._upd_lbl.set_halign(Gtk.Align.END)
-        bottom.pack_end(self._upd_lbl, False, False, 0)
+        self._upd_lbl.set_halign(Gtk.Align.CENTER)
+        bottom.pack_start(self._upd_lbl, True, True, 0)
+
+        # Resize grip — bottom-right corner drag handle
+        grip_lbl = Gtk.Label(label="◢")
+        grip_lbl.get_style_context().add_class("resize-grip")
+        grip_eb = Gtk.EventBox()
+        grip_eb.add(grip_lbl)
+        grip_eb.connect("button-press-event", self._on_resize_grip)
+        grip_eb.connect("realize", self._set_resize_cursor)
+        bottom.pack_end(grip_eb, False, False, 0)
+
         self._card.pack_start(bottom, False, False, 0)
 
-    def _on_drag(self, widget, event):
+    # ── Drag / resize ─────────────────────────────────────────────────────────
+    def _on_drag_or_resize(self, widget, event):
         if event.button == 1:
             self._win.begin_move_drag(
                 event.button, int(event.x_root), int(event.y_root), event.time
             )
             GLib.timeout_add(600, self._save_pos)
 
-    def _load_pos(self):
+    def _on_resize_grip(self, widget, event):
+        if event.button == 1:
+            self._win.begin_resize_drag(
+                Gdk.WindowEdge.SOUTH_EAST,
+                event.button, int(event.x_root), int(event.y_root), event.time
+            )
+
+    def _set_resize_cursor(self, widget):
+        widget.get_window().set_cursor(
+            Gdk.Cursor.new_from_name(Gdk.Display.get_default(), "se-resize")
+        )
+
+    # ── Configure / scale ─────────────────────────────────────────────────────
+    def _on_configure(self, win, event):
+        if self._resize_timer:
+            GLib.source_remove(self._resize_timer)
+        self._resize_timer = GLib.timeout_add(150, self._on_resize_settled)
+
+    def _on_resize_settled(self):
+        self._resize_timer = None
+        w, _ = self._win.get_size()
+        new_scale = max(0.6, min(3.0, w / BASE_FLOAT_WIDTH))
+        if abs(new_scale - self._scale) > 0.02:
+            self._scale = new_scale
+            self._on_scale_change(new_scale)
+        self._save_size()
+        return False   # one-shot
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+    def _read_cfg(self) -> dict:
         if CONFIG_FILE.exists():
             try:
-                return json.loads(CONFIG_FILE.read_text()).get("float_pos")
+                return json.loads(CONFIG_FILE.read_text())
             except Exception:
                 pass
-        return None
+        return {}
+
+    def _write_cfg(self, cfg: dict):
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+    def _load_pos(self):
+        return self._read_cfg().get("float_pos")
 
     def _save_pos(self):
         x, y = self._win.get_position()
-        cfg  = {}
-        if CONFIG_FILE.exists():
-            try:
-                cfg = json.loads(CONFIG_FILE.read_text())
-            except Exception:
-                pass
+        cfg  = self._read_cfg()
         cfg["float_pos"] = [x, y]
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-        return False  # one-shot
-
-    def _save_visibility(self, visible: bool):
-        cfg = {}
-        if CONFIG_FILE.exists():
-            try:
-                cfg = json.loads(CONFIG_FILE.read_text())
-            except Exception:
-                pass
-        cfg["float_visible"] = visible
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-
-    def was_visible(self) -> bool:
-        if CONFIG_FILE.exists():
-            try:
-                return json.loads(CONFIG_FILE.read_text()).get("float_visible", False)
-            except Exception:
-                pass
+        self._write_cfg(cfg)
         return False
 
+    def _load_size(self):
+        return self._read_cfg().get("float_size")
+
+    def _save_size(self):
+        w, h = self._win.get_size()
+        cfg  = self._read_cfg()
+        cfg["float_size"] = [w, h]
+        self._write_cfg(cfg)
+
+    def _save_visibility(self, visible: bool):
+        cfg = self._read_cfg()
+        cfg["float_visible"] = visible
+        self._write_cfg(cfg)
+
+    def was_visible(self) -> bool:
+        return self._read_cfg().get("float_visible", False)
+
+    # ── Content ───────────────────────────────────────────────────────────────
     def update(self, data: UsageData):
         self._plan_lbl.set_text(f"{data.name}  ·  {data.plan}" if data.name else data.plan)
         for child in self._content_slot.get_children():
@@ -1018,15 +1071,21 @@ class FloatingWindow:
         self._content_slot.pack_start(build_content(data), False, False, 0)
         self._upd_lbl.set_text(fmt_updated(data.updated_at))
         self._content_slot.show_all()
-        self._win.resize(1, 1)   # shrink to natural height after content change
 
     def show(self):
         self._win.show_all()
+        size = self._load_size()
+        if size:
+            self._win.resize(size[0], size[1])
+            # Recompute scale immediately so CSS matches saved size
+            saved_scale = max(0.6, min(3.0, size[0] / BASE_FLOAT_WIDTH))
+            if abs(saved_scale - self._scale) > 0.02:
+                self._scale = saved_scale
+                self._on_scale_change(saved_scale)
         pos = self._load_pos()
         if pos:
             self._win.move(pos[0], pos[1])
         else:
-            self._win.resize(1, 1)
             GLib.idle_add(self._default_pos)
         self._save_visibility(True)
 
@@ -1042,6 +1101,9 @@ class FloatingWindow:
 
     def is_visible(self) -> bool:
         return self._win.get_visible()
+
+    def get_scale(self) -> float:
+        return self._scale
 
 
 # ── Settings dialog ───────────────────────────────────────────────────────────
@@ -1067,13 +1129,11 @@ class SettingsDialog:
 
         row = 0
 
-        # ── Auto Refresh ──────────────────────────────────────────────────────
         self._ar_check = Gtk.CheckButton(label="Auto Refresh")
         self._ar_check.set_active(settings.auto_refresh)
         grid.attach(self._ar_check, 0, row, 2, 1)
         row += 1
 
-        # ── Refresh Interval ──────────────────────────────────────────────────
         ri_lbl = Gtk.Label(label="Refresh Interval (seconds)")
         ri_lbl.set_halign(Gtk.Align.START)
         adj = Gtk.Adjustment(
@@ -1087,11 +1147,9 @@ class SettingsDialog:
         grid.attach(self._ri_spin, 1, row, 1, 1)
         row += 1
 
-        # ── Separator ─────────────────────────────────────────────────────────
         grid.attach(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), 0, row, 2, 1)
         row += 1
 
-        # ── Opacity ───────────────────────────────────────────────────────────
         op_lbl = Gtk.Label(label="Opacity (floating window)")
         op_lbl.set_halign(Gtk.Align.START)
         op_adj = Gtk.Adjustment(
@@ -1103,21 +1161,18 @@ class SettingsDialog:
         self._op_scale.set_size_request(200, -1)
         self._op_scale.set_digits(2)
         self._op_scale.set_draw_value(True)
-        grid.attach(op_lbl,        0, row, 1, 1)
+        grid.attach(op_lbl,         0, row, 1, 1)
         grid.attach(self._op_scale, 1, row, 1, 1)
         row += 1
 
-        # ── Apply opacity to popup ────────────────────────────────────────────
         self._pop_check = Gtk.CheckButton(label="Also apply opacity to left-click popup")
         self._pop_check.set_active(settings.opacity_popup)
         grid.attach(self._pop_check, 0, row, 2, 1)
         row += 1
 
-        # ── Separator ─────────────────────────────────────────────────────────
         grid.attach(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), 0, row, 2, 1)
         row += 1
 
-        # ── Progress Bar Color ────────────────────────────────────────────────
         bc_lbl = Gtk.Label(label="Progress Bar Color")
         bc_lbl.set_halign(Gtk.Align.START)
         self._bc_btn = Gtk.ColorButton()
@@ -1127,7 +1182,6 @@ class SettingsDialog:
         grid.attach(self._bc_btn, 1, row, 1, 1)
         row += 1
 
-        # ── Background Color ──────────────────────────────────────────────────
         bg_lbl = Gtk.Label(label="Background Color")
         bg_lbl.set_halign(Gtk.Align.START)
         self._bg_btn = Gtk.ColorButton()
@@ -1137,7 +1191,6 @@ class SettingsDialog:
         grid.attach(self._bg_btn, 1, row, 1, 1)
         row += 1
 
-        # ── Buttons ───────────────────────────────────────────────────────────
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_box.set_halign(Gtk.Align.END)
         btn_box.set_margin_top(4)
@@ -1212,8 +1265,11 @@ class ClaudeTrayApp:
         self._fetcher        = ClaudeUsageFetcher()
         self._session_reader = ClaudeSessionReader()
         self._popup          = LeftClickPopup(on_refresh=self._do_refresh)
-        self._float          = FloatingWindow(on_refresh=self._do_refresh)
-        self._settings_dlg   = SettingsDialog(self._settings, on_apply=self._apply_settings)
+        self._float          = FloatingWindow(
+            on_refresh      = self._do_refresh,
+            on_scale_change = self._on_float_scale,
+        )
+        self._settings_dlg = SettingsDialog(self._settings, on_apply=self._apply_settings)
 
         self._apply_opacity()
 
@@ -1234,6 +1290,12 @@ class ClaudeTrayApp:
             self._settings.refresh_interval, self._refresh_timer
         )
         GLib.timeout_add_seconds(30, self._ui_tick)
+
+    # ── Scale callback ────────────────────────────────────────────────────────
+    def _on_float_scale(self, scale: float):
+        self._css_provider.load_from_data(
+            build_css(self._settings.bg_color, self._settings.bar_color, scale).encode()
+        )
 
     # ── Settings persistence ──────────────────────────────────────────────────
     def _load_settings(self) -> AppSettings:
@@ -1274,7 +1336,8 @@ class ClaudeTrayApp:
         self._settings = settings
 
         self._css_provider.load_from_data(
-            build_css(settings.bg_color, settings.bar_color).encode()
+            build_css(settings.bg_color, settings.bar_color,
+                      self._float.get_scale()).encode()
         )
         self._apply_opacity()
 
@@ -1321,7 +1384,7 @@ class ClaudeTrayApp:
     def _refresh_timer(self) -> bool:
         if self._settings.auto_refresh:
             self._do_refresh()
-        return True  # keep timer alive
+        return True
 
     def _ui_tick(self) -> bool:
         data = self._merge_sessions(self._fetcher.get())
