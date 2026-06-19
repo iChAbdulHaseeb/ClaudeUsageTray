@@ -33,6 +33,7 @@ except ImportError:
 # ── Paths ─────────────────────────────────────────────────────────────────────
 CONFIG_DIR  = Path.home() / ".config" / "claude-tray"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+CACHE_FILE  = CONFIG_DIR / "usage_cache.json"
 ICON_FILE   = CONFIG_DIR / "icon.png"
 LOG_FILE    = CONFIG_DIR / "app.log"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -299,7 +300,7 @@ LIMIT_LABEL = {
 class ClaudeUsageFetcher:
     def __init__(self):
         self._lock    = threading.Lock()
-        self._data    = UsageData(error="Loading…")
+        self._data    = self._load_cache()
         self._org_id  = None
         self._session = self._make_session()
         self._load_cfg()
@@ -327,6 +328,45 @@ class ClaudeUsageFetcher:
         if self._org_id:
             cfg["org_id"] = self._org_id
         CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+    def _load_cache(self) -> UsageData:
+        if not CACHE_FILE.exists():
+            return UsageData(error="Loading…")
+        try:
+            raw    = json.loads(CACHE_FILE.read_text())
+            limits = [LimitEntry(**lim) for lim in raw.get("limits", [])]
+            ts     = raw.get("updated_at")
+            return UsageData(
+                limits     = limits,
+                plan       = raw.get("plan", "Pro"),
+                updated_at = datetime.fromisoformat(ts) if ts else None,
+            )
+        except Exception:
+            return UsageData(error="Loading…")
+
+    def _save_cache(self):
+        d = self._data
+        if d.error and not d.limits:
+            return
+        try:
+            raw = {
+                "limits": [
+                    {
+                        "label":       lim.label,
+                        "pct":         lim.pct,
+                        "severity":    lim.severity,
+                        "resets_at":   lim.resets_at,
+                        "is_weekly":   lim.is_weekly,
+                        "placeholder": lim.placeholder,
+                    }
+                    for lim in d.limits
+                ],
+                "plan":       d.plan,
+                "updated_at": d.updated_at.isoformat() if d.updated_at else None,
+            }
+            CACHE_FILE.write_text(json.dumps(raw, indent=2))
+        except Exception as e:
+            log.debug(f"Cache save: {e}")
 
     def _load_cookies(self) -> bool:
         if not HAS_BROWSER_COOKIES:
@@ -457,6 +497,7 @@ class ClaudeUsageFetcher:
             d.updated_at = datetime.now()
             with self._lock:
                 self._data = d
+            self._save_cache()
 
         except Exception:
             log.exception("Refresh failed")
@@ -911,6 +952,7 @@ class FloatingWindow:
         self._content_slot.pack_start(build_content(data), False, False, 0)
         self._upd_lbl.set_text(fmt_updated(data.updated_at))
         self._content_slot.show_all()
+        self._win.resize(1, 1)   # shrink to natural height after content change
 
     def show(self):
         self._win.show_all()
