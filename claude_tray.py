@@ -11,6 +11,7 @@ import threading
 import json
 import logging
 import os
+import sys
 import time as _time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -241,6 +242,7 @@ class AppSettings:
     refresh_interval: int   = 60
     opacity:          float = 1.0
     opacity_popup:    bool  = False
+    keep_below:       bool  = False
     bar_color:        str   = ACCENT
     bg_color:         str   = BG
 
@@ -920,6 +922,7 @@ class FloatingWindow:
         self._win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         self._win.set_decorated(False)
         self._win.set_keep_above(True)
+        self._win.set_keep_below(False)
         self._win.set_resizable(True)
         self._win.set_size_request(200, -1)
         self._win.get_style_context().add_class("float-win")
@@ -1108,6 +1111,14 @@ class FloatingWindow:
     def get_scale(self) -> float:
         return self._scale
 
+    def apply_z_order(self, keep_below: bool):
+        if keep_below:
+            self._win.set_keep_above(False)
+            self._win.set_keep_below(True)
+        else:
+            self._win.set_keep_below(False)
+            self._win.set_keep_above(True)
+
 
 # ── Settings dialog ───────────────────────────────────────────────────────────
 class SettingsDialog:
@@ -1173,6 +1184,11 @@ class SettingsDialog:
         grid.attach(self._pop_check, 0, row, 2, 1)
         row += 1
 
+        self._kb_check = Gtk.CheckButton(label="Keep floating window below other windows")
+        self._kb_check.set_active(settings.keep_below)
+        grid.attach(self._kb_check, 0, row, 2, 1)
+        row += 1
+
         grid.attach(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), 0, row, 2, 1)
         row += 1
 
@@ -1195,8 +1211,14 @@ class SettingsDialog:
         row += 1
 
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        btn_box.set_halign(Gtk.Align.END)
         btn_box.set_margin_top(4)
+
+        restart_btn = Gtk.Button(label="Restart")
+        restart_btn.connect("clicked", self._restart)
+        btn_box.pack_start(restart_btn, False, False, 0)
+
+        spacer = Gtk.Box()
+        btn_box.pack_start(spacer, True, True, 0)
 
         reset_btn = Gtk.Button(label="Reset Defaults")
         reset_btn.connect("clicked", self._reset_defaults)
@@ -1218,6 +1240,7 @@ class SettingsDialog:
             refresh_interval = int(self._ri_spin.get_value()),
             opacity          = round(self._op_scale.get_value(), 2),
             opacity_popup    = self._pop_check.get_active(),
+            keep_below       = self._kb_check.get_active(),
             bar_color        = _rgba_to_hex(self._bc_btn.get_rgba()),
             bg_color         = _rgba_to_hex(self._bg_btn.get_rgba()),
         )
@@ -1225,12 +1248,17 @@ class SettingsDialog:
     def _apply(self, _):
         self._on_apply(self._collect())
 
+    def _restart(self, _):
+        self._on_apply(self._collect())
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
     def _reset_defaults(self, _):
         defaults = AppSettings()
         self._ar_check.set_active(defaults.auto_refresh)
         self._ri_spin.set_value(defaults.refresh_interval)
         self._op_scale.set_value(defaults.opacity)
         self._pop_check.set_active(defaults.opacity_popup)
+        self._kb_check.set_active(defaults.keep_below)
         self._bc_btn.set_rgba(_hex_to_rgba(defaults.bar_color))
         self._bg_btn.set_rgba(_hex_to_rgba(defaults.bg_color))
         self._on_apply(defaults)
@@ -1240,6 +1268,7 @@ class SettingsDialog:
         self._ri_spin.set_value(settings.refresh_interval)
         self._op_scale.set_value(settings.opacity)
         self._pop_check.set_active(settings.opacity_popup)
+        self._kb_check.set_active(settings.keep_below)
         self._bc_btn.set_rgba(_hex_to_rgba(settings.bar_color))
         self._bg_btn.set_rgba(_hex_to_rgba(settings.bg_color))
 
@@ -1273,6 +1302,7 @@ class ClaudeTrayApp:
             on_refresh      = self._do_refresh,
             on_scale_change = self._on_float_scale,
         )
+        self._float.apply_z_order(self._settings.keep_below)
         self._settings_dlg = SettingsDialog(self._settings, on_apply=self._apply_settings)
 
         self._apply_opacity()
@@ -1311,6 +1341,7 @@ class ClaudeTrayApp:
                     refresh_interval = s.get("refresh_interval", 60),
                     opacity          = s.get("opacity",          1.0),
                     opacity_popup    = s.get("opacity_popup",    False),
+                    keep_below       = s.get("keep_below",       False),
                     bar_color        = s.get("bar_color",        ACCENT),
                     bg_color         = s.get("bg_color",         BG),
                 )
@@ -1330,6 +1361,7 @@ class ClaudeTrayApp:
             "refresh_interval": self._settings.refresh_interval,
             "opacity":          self._settings.opacity,
             "opacity_popup":    self._settings.opacity_popup,
+            "keep_below":       self._settings.keep_below,
             "bar_color":        self._settings.bar_color,
             "bg_color":         self._settings.bg_color,
         }
@@ -1344,6 +1376,7 @@ class ClaudeTrayApp:
                       self._float.get_scale()).encode()
         )
         self._apply_opacity()
+        self._float.apply_z_order(settings.keep_below)
 
         if interval_changed:
             GLib.source_remove(self._refresh_timer_id)
